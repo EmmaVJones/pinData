@@ -1,0 +1,295 @@
+---
+title: "Monthly Monitoring Results Pin"
+author: "Emma Jones"
+date: "7/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+httr::set_config(httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE))
+
+library(tidyverse)
+library(config)
+library(sf)
+library(plotly)
+library(lubridate)
+library(pool)
+library(pins)
+library(sqldf)
+library(dbplyr)
+
+
+# Server connection things
+conn <- config::get("connectionSettings") # get configuration settings
+
+
+board_register_rsconnect(key = conn$CONNECT_API_KEY,  #Sys.getenv("CONNECT_API_KEY"),
+                         server = conn$CONNECT_SERVER)#Sys.getenv("CONNECT_SERVER"))
+
+## For testing: connect to ODS production
+# pool <- dbPool(
+#  drv = odbc::odbc(),
+#  Driver = "ODBC Driver 11 for SQL Server",#"SQL Server Native Client 11.0",
+#  Server= "DEQ-SQLODS-PROD,50000",
+#  dbname = "ODS",
+#  trusted_connection = "yes"
+# )
+# For deployment on the R server: Set up pool connection to production environment
+pool <- dbPool(
+  drv = odbc::odbc(),
+  Driver = "SQLServer",   # note the LACK OF space between SQL and Server ( how RStudio named driver)
+  # Production Environment
+  Server= "DEQ-SQLODS-PROD,50000",
+  dbname = "ODS",
+  UID = conn$UID_prod,
+  PWD = conn$PWD_prod,
+  #UID = Sys.getenv("userid_production"), # need to change in Connect {vars}
+  #PWD = Sys.getenv("pwd_production")   # need to change in Connect {vars}
+  # Test environment
+  #Server= "WSQ04151,50000",
+  #dbname = "ODS_test",
+  #UID = Sys.getenv("userid"),  # need to change in Connect {vars}
+  #PWD = Sys.getenv("pwd"),  # need to change in Connect {vars}
+  trusted_connection = "yes"
+)
+
+
+```
+
+## required functions
+
+```{r functions}
+# bring in methods and data for automated assessment to work
+source('methods/conventionalsFunction.R')
+source('methods/updatedBacteriaCriteria.R')
+source('methods/3.automatedAssessment_global2024.R')
+source('methods/automatedAssessmentFunctions.R')
+source('methods/assessmentFunction.R')
+lakeNutStandards <- read_csv('data/9VAC25-260-187lakeNutrientStandards.csv')
+
+
+```
+
+## Change any incorrect Collector region tags
+
+```{r collector fix}
+#specialRegionalFixes <- pool %>% tbl(in_schema("wqm", "Wqm_Collector_Cds_Codes_Wqm_View")) %>% as_tibble()
+#write.csv(specialRegionalFixes, 'data/updated__Wqm_Collector_Cds_Codes_Wqm_View.csv', row.names = F)
+specialRegionalFixes <- read_csv('data/updated__Wqm_Collector_Cds_Codes_Wqm_View.csv')
+```
+
+
+
+## Data Query
+
+```{r query}
+statewideResults <- list()
+
+for(region in  c('BRRO', 'PRO','NRO', 'SWRO','TRO', 'VRO')){
+  
+  print(region)
+  
+   # default set to Jan 1 of current year
+    dateRange <-c(as.Date(paste0(year(Sys.Date()) - 1,'-01-01')), as.Date(Sys.Date())) # c(as.Date('2015-01-01'), as.Date('2020-12-31'))#
+    dateRangeYTD <-c(as.Date(paste0(year(Sys.Date()),'-01-01')), as.Date(Sys.Date())) # c(as.Date('2015-01-01'), as.Date('2020-12-31'))#
+
+    if(region == 'BRRO'){
+       region1 <- c('SCRO', 'WCRO')# convert BRRO to codes manually until fixed in CEDS
+    } else { 
+      if(region == 'NRO'){
+        region1 <- 'NVRO'
+      } else {
+          region1 <- region}}
+    spgCodes <- NULL#c('IM', 'TM')
+
+    collectors <- filter(specialRegionalFixes, Unt_Rec_Code %in% region1)$Col_Id
+ 
+if(!is.null(region1)){
+  peeps <- pool %>% tbl(in_schema("wqm", "Wqm_Collector_Cds_Codes_Wqm_View")) %>% 
+    filter( Col_Id %in% !! collectors) %>% 
+    # Old way
+    # {if(any(region1 %in% c('SCRO', 'WCRO')))
+    #   filter(., Unt_Rec_Code %in% !! region1 | Col_Id == 'RJS') 
+    #   else filter(., Unt_Rec_Code %in% !! region1 ) } %>% 
+    as_tibble()
+  } else {peeps <- tibble()}
+
+
+stationFieldData <- pool %>% tbl(in_schema("wqm", "Wqm_Field_Data_View")) %>%
+  filter(between(as.Date(Fdt_Date_Time), !! dateRange[1], !! dateRange[2]) ) %>% # date range always required
+  # if Region (aka people) selected
+  {if(nrow(peeps) > 0)
+    filter(., Fdt_Collector_Id %in% !! peeps$Col_Id )
+    else . } %>%
+  # if Program Code selected
+  {if(!is.null(spgCodes))
+    filter(., Fdt_Spg_Code %in% !! spgCodes)
+    else . } %>% 
+  # always drop crap data
+  filter(! Ssc_Description %in% "INVALID DATA SET QUALITY ASSURANCE FAILURE") %>% 
+  as_tibble() 
+
+stationFieldDataYTD <- stationFieldData %>% 
+  filter(between(as.Date(Fdt_Date_Time), !! dateRangeYTD[1], !! dateRangeYTD[2]) ) # date range always required
+ 
+# still need this for other functions
+station <- unique(stationFieldData$Fdt_Sta_Id)
+stationYTD <- unique(stationFieldDataYTD$Fdt_Sta_Id)
+
+           
+stationAnalyteData <- pool %>% tbl(in_schema("wqm", "Wqm_Analytes_View")) %>%
+  filter(Ana_Sam_Fdt_Id %in% !! stationFieldData$Fdt_Id &
+           #between(as.Date(Ana_Received_Date), !! dateRange[1], !! dateRange[2]) & # x >= left & x <= right
+           Pg_Parm_Name != "STORET STORAGE TRANSACTION DATE YR/MO/DAY") %>%
+  as_tibble() %>%
+  left_join(dplyr::select(stationFieldData, Fdt_Id, Fdt_Sta_Id, Fdt_Date_Time), by = c("Ana_Sam_Fdt_Id" = "Fdt_Id"))
+stationAnalyteDataYTD <- stationAnalyteData %>%
+  filter(Ana_Sam_Fdt_Id %in% !! stationFieldDataYTD$Fdt_Id &
+           #between(as.Date(Ana_Received_Date), !! dateRange[1], !! dateRange[2]) & # x >= left & x <= right
+           Pg_Parm_Name != "STORET STORAGE TRANSACTION DATE YR/MO/DAY") 
+
+
+
+stationInfo <- pool %>% tbl(in_schema("wqm",  "Wqm_Stations_View")) %>%
+  filter(Sta_Id %in% !! toupper(station)) %>%
+  as_tibble()
+stationInfoYTD <- stationInfo %>%
+  filter(Sta_Id %in% !! toupper(stationYTD))
+
+stationGIS_View <-  pool %>% tbl(in_schema("wqm",  "Wqm_Sta_GIS_View")) %>%
+  filter(Station_Id %in% !! toupper(station)) %>%
+  as_tibble()
+stationGIS_ViewYTD <- stationGIS_View %>%
+  filter(Station_Id %in% !! toupper(stationYTD)) 
+
+WQSlookup <- pin_get("WQSlookup-withStandards",  board = "rsconnect")
+WQMstationSpatial <- pin_get("WQM-Stations-Spatial", board = "rsconnect")
+VSCIresults <- pin_get("VSCIresults", board = "rsconnect") %>%
+  filter( between(as.Date(`Collection Date`), dateRange[1], dateRange[2]) )
+VSCIresultsYTD <- VSCIresults %>%
+  filter( between(as.Date(`Collection Date`), dateRangeYTD[1], dateRangeYTD[2]) )
+
+
+stationTable <- left_join(tibble(STATION_ID = station),
+                          WQSlookup, by = c('STATION_ID'='StationID')) %>%
+  mutate(CLASS_BASIN = paste(CLASS,substr(BASIN, 1,1), sep="_")) %>%
+  mutate(CLASS_BASIN = ifelse(CLASS_BASIN == 'II_7', "II_7", as.character(CLASS))) %>%
+  # Fix for Class II Tidal Waters in Chesapeake (bc complicated DO/temp/etc standard)
+  left_join(WQSvalues, by = 'CLASS_BASIN') %>%
+  dplyr::select(-c(CLASS.y,CLASS_BASIN)) %>%
+  rename('CLASS' = 'CLASS.x') %>%
+  left_join(WQMstationSpatial %>% distinct(StationID, .keep_all = TRUE), by = c('STATION_ID' = 'StationID')) %>%
+  # last cycle had code to fix Class II Tidal Waters in Chesapeake (bc complicated DO/temp/etc standard) but not sure if necessary
+  lakeNameStandardization() %>% # standardize lake names
+  
+   
+  # extra special step
+  mutate(Lake_Name = case_when(STATION_ID %in% c('2-TRH000.40') ~ 'Thrashers Creek Reservoir',
+                               STATION_ID %in% c('2-LSL000.16') ~ 'Lone Star Lake F (Crystal Lake)',
+                               STATION_ID %in% c('2-LSL000.04') ~ 'Lone Star Lake G (Crane Lake)',
+                               STATION_ID %in% c('2-LSL000.20') ~ 'Lone Star Lake I (Butler Lake)',
+                               STATION_ID %in% c('2-NWB002.93','2-NWB004.67', '2-NWB006.06') ~ 'Western Branch Reservoir',
+                               STATION_ID %in% c('2-LDJ000.60') ~ 'Lake Nottoway (Lee Lake)',
+                               TRUE ~ as.character(Lake_Name))) %>%
+  left_join(lakeNutStandards %>% 
+              mutate(Lakes_187B = 'y'),  # special step to make sure the WQS designation for 187 are correct even when not
+            by = c('Lake_Name')) %>%
+  # lake drummond special standards
+  mutate(Lakes_187B = ifelse(is.na(Lakes_187B.y ), Lakes_187B.x, Lakes_187B.y), 
+    `Chlorophyll a (ug/L)` = case_when(Lake_Name %in% c('Lake Drummond') ~ 35,
+                                            TRUE ~ as.numeric(`Chlorophyll a (ug/L)`)),
+         `Total Phosphorus (ug/L)` = case_when(Lake_Name %in% c('Lake Drummond') ~ 40,
+                                               TRUE ~ as.numeric(`Total Phosphorus (ug/L)`))) %>% 
+  dplyr::select(STATION_ID:StreamType, Lakes_187B, `Description Of Waters`:`Total Phosphorus (ug/L)`)
+
+stationTableYTD <- filter(stationTable, STATION_ID %in% stationYTD)
+
+
+
+conventionals <- conventionalsSummary(conventionals= pin_get("conventionals2022IRfinalWithSecchi", board = "rsconnect")[0,],
+                           stationFieldDataUserFilter= stationFieldData, stationAnalyteDataUserFilter = stationAnalyteData,
+                           stationInfo,
+                           stationGIS_View,
+                           dropCodes = c('QF'))%>% 
+  arrange(FDT_STA_ID, FDT_DATE_TIME, FDT_DEPTH) 
+
+conventionalsYTD <- conventionalsSummary(conventionals= pin_get("conventionals2022IRfinalWithSecchi", board = "rsconnect")[0,],
+                           stationFieldDataUserFilter= stationFieldDataYTD, stationAnalyteDataUserFilter = stationAnalyteDataYTD,
+                           stationInfoYTD,
+                           stationGIS_ViewYTD,
+                           dropCodes = c('QF'))%>% 
+  arrange(FDT_STA_ID, FDT_DATE_TIME, FDT_DEPTH) 
+
+# run assessment
+# identify whether a station is a lake station or not
+
+assessmentStations <-  pool %>% tbl(in_schema("wqa", "Wqa_Station_Details_View")) %>% 
+  filter(STA_NAME %in% !! station) %>% 
+  as_tibble() %>% 
+  group_by(STA_NAME) %>% 
+  filter(WSD_CYCLE == max(WSD_CYCLE))
+
+lakeStations <- pool %>% tbl(in_schema("wqa", "WQA_Station_Types_View")) %>% 
+  filter(STX_STATION_DETAIL_ID %in% !! assessmentStations$WXA_STATION_DETAIL_ID && STL_TYPE_CODE == 'L') %>% 
+  as_tibble() %>% 
+  left_join(assessmentStations, by = c('STX_STATION_DETAIL_ID' = 'WXA_STATION_DETAIL_ID')) %>% 
+  distinct(WSD_STATION_ID) %>% 
+  pull()
+
+lacustrineDesignation <- filter(assessmentStations, WSD_STATION_ID %in% lakeStations &&  WSD_LAC_ZONE_YN == 'Y') %>% 
+  distinct( WSD_STATION_ID) %>% 
+  pull()
+
+assessmentResults <- automatedAssessmentFunction(stationTable, conventionals, 
+                                                 lakeStations = filter(stationTable, STATION_ID %in% lakeStations ), 
+                                                 lacustrineDesignation = filter(stationTable, STATION_ID %in% lacustrineDesignation), 
+                                                 VSCIresults)
+assessmentResultsYTD <- automatedAssessmentFunction(stationTableYTD, conventionalsYTD, 
+                                                 lakeStations = filter(stationTableYTD, STATION_ID %in% lakeStations ), 
+                                                 lacustrineDesignation = filter(stationTableYTD, STATION_ID %in% lacustrineDesignation), 
+                                                 VSCIresultsYTD)
+
+
+## combine to neat list for other uses
+monitoringResults <- list(
+  Region = region,
+  pullDate = as.Date(Sys.Date()),
+  `Date Range` = dateRange,
+  stationFieldData = stationFieldData,
+  stationAnalyteData = stationAnalyteData, 
+  stationInfo = stationInfo,
+  stationGIS_View = stationGIS_View,
+  stationTable = stationTable,
+  Conventionals = conventionals,
+  SPGcodes = unique(conventionals$FDT_SPG_CODE),
+  `Assessment Results` = assessmentResults,
+  
+  `Date Range YTD` = dateRangeYTD,
+  stationFieldDataYTD = stationFieldDataYTD,
+  stationAnalyteDataYTD = stationAnalyteDataYTD, 
+  stationInfoYTD = stationInfoYTD,
+  stationGIS_ViewYTD = stationGIS_ViewYTD,
+  stationTableYTD = stationTableYTD,
+  ConventionalsYTD = conventionalsYTD, 
+  SPGcodesYTD = unique(conventionalsYTD$FDT_SPG_CODE),
+  `Assessment Results YTD` = assessmentResultsYTD
+)
+
+statewideResults[[region]] <- monitoringResults
+}
+
+
+
+```
+
+
+## pin to server
+
+```{r pin data}
+
+pin(statewideResults, description = 'Monitoring results to date, rerun in the middle of each month', board = 'rsconnect')
+#monResults <- pin_get("ejones/statewideResults", board = "rsconnect")
+```
+
