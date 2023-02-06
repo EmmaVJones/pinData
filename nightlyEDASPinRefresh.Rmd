@@ -1,29 +1,22 @@
 ---
-title: "Benthic Data Pin"
+title: "Nightly EDAS Pin updates"
+author: "Emma Jones"
+date: "3/2/2021"
 output: html_document
 resource_files:
 - config.yml
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.cpg
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.dbf
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.prj
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.sbn
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.sbx
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.shp.xml
-- data/GIS/VA_SUBWATERSHED_6TH_ORDER_STG.shx
-- data/GIS/VA_level3ecoregion_WGS84.cpg
-- data/GIS/VA_level3ecoregion_WGS84.dbf
-- data/GIS/VA_level3ecoregion_WGS84.prj
-- data/GIS/VA_level3ecoregion_WGS84.sbx
-- data/GIS/VA_level3ecoregion_WGS84.shp.xml
-- data/GIS/VA_level3ecoregion_WGS84.shx
-- data/GIS/VA_level3ecoregion_WGS84.sbn
 ---
+
+
+This nightly pin update is only run seasonally during assessment periods. Typically, the EDAS data is analyzed and make available weekly to biologists; however, during the period leading up to an assessment, we need the biologists to be able to enter data and analyze the data as soon as possible (the next day due to ODS refresh rate).
+
+This pin is scheduled to run nightly on the Connect platform for the critical period of time ~February-June during an assessment year.
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE)
 
 httr::set_config(httr::config(ssl_verifypeer = FALSE, ssl_verifyhost = FALSE))
-
 
 library(tidyverse)
 library(sf)
@@ -45,9 +38,10 @@ board_register_rsconnect(key = conn$CONNECT_API_KEY,  #Sys.getenv("CONNECT_API_K
 source('helperFunctions/VSCI_metrics_GENUS.R')
 source('helperFunctions/VCPMI_metrics_GENUS.R')
 
-```
 
-```{r connect to ODS_test}
+```
+ 
+```{r connect to ODS}
 ## For testing: connect to ODS production
 # pool <- dbPool(
 #   drv = odbc::odbc(),
@@ -70,13 +64,6 @@ pool <- dbPool(
 
 # con <- dbConnect(odbc::odbc(),.connection_string = 'driver={SQL Server Native Client 11.0};server={DEQ-SQLODS-PROD,50000};database={ODS};trusted_connection=yes')
 
-```
-
-Pull CollectorID information
-
-```{r collectorID}
-collectorID <- pool %>% tbl(in_schema("wqm", "Wqm_Collector_Cds_Codes_Wqm_View")) %>% 
-    as_tibble()
 ```
 
 
@@ -197,6 +184,7 @@ habValues <- pool %>% tbl(in_schema("wqm",  "Edas_Habitat_Values_View")) %>%
         dplyr::select(HabSampID, HabParameter, HabParameterDescription, HabValue, `HabValue Comment`)
 ```
 
+
 Pull WQM_Stations_View.
 
 ```{r WQM_Stations_View}
@@ -204,12 +192,14 @@ WQM_Stations_View <- pool %>% tbl(in_schema("wqm",  "Wqm_Stations_View")) %>%
   as_tibble()
 ```
 
+
 Pull WQM_Sta_GIS_View.
 
 ```{r WQM_Sta_GIS_View}
 WQM_Sta_GIS_View <- pool %>% tbl(in_schema("wqm",  "Wqm_Sta_GIS_View")) %>%  
   as_tibble()
 ```
+
 
 Pull HabObs
 
@@ -231,20 +221,6 @@ totalHabitatScore <- habValues %>%
   summarise(`Total Habitat Score` = sum(HabValue, na.rm = T)) %>% 
   left_join(habSamps, by = 'HabSampID') %>% 
   dplyr::select(StationID, `Collection Date`, HabSampID, `Field Team`, `HabSample Comment`, Gradient, Season, `Total Habitat Score`)
-```
-
-
-
-Pull WQM Stations Full From GIS REST service.
-
-```{r wqm_stations_full}
-WQM_Station_Full <- suppressWarnings(
-      geojson_sf("http://gis.deq.virginia.gov/arcgis/rest/services/staff/DEQInternalDataViewer/MapServer/104/query?&where=OBJECTID%3E0&outFields=*&f=geojson")) %>%
-      mutate(WQM_YRS_YEAR = as.Date(as.POSIXct(as.numeric(gsub(" ", ".",gsub("(.{10})", "\\1 ", sprintf("%.0f", as.numeric(WQM_YRS_YEAR))))), origin="1970-01-01")))
-
-WQM_Station_Full <- bind_cols(WQM_Station_Full, st_coordinates(WQM_Station_Full) %>% as_tibble()) %>%
-  mutate(Latitude = Y, Longitude = X) %>% dplyr::select(-c(X, Y))
-
 ```
 
 Create a BenSampsStations dataset with ecoregion and assessment region information
@@ -319,8 +295,6 @@ WQM_Stations_Spatial3 <- bind_rows(filter(WQM_Stations_Spatial2, !StationID %in%
 WQM_Stations_Spatial <- bind_rows(WQM_Stations_Spatial_pin, WQM_Stations_Spatial3)
 
 ```
-
-
 
 Make a benSampsStations dataset that has spatially derived ecoregion, subbasin, and assessment info.
 
@@ -505,69 +479,10 @@ VCPMI65results$Season <-  factor(VCPMI65results$Season,levels=c("Spring","Outsid
 
 
 
-Pull Enforcement Data
-
-```{r enforcement, eval = FALSE}
-# Facilities Data (for joining)
-enfFacilities <- pool %>% tbl(in_schema("enf",  "Enf_Facilities_View")) %>%
-  as_tibble()
-
-# get start of year filter information
-startOfYear <- as.Date(paste0(year(Sys.Date()), '-01-01'))
-
-# Case data
-enfCases <- pool %>% tbl(in_schema("enf",  "Enf_enforcement_Cases_View")) %>%
-  filter(between(Enc_Executed_Date, !! startOfYear, !! Sys.Date()) |
-           between(Enc_Nov_Date, !! startOfYear, !! Sys.Date()) |
-           between(Enc_Terminated_Date, !! startOfYear, !! Sys.Date()) ) %>%
-  as_tibble() %>%
-  dplyr::select(Enc_Enf_Facility_Id, 
-                `EA Number` = Enc_Ea_Number,
-                `Facility Region` = EFC_REGION,
-                `Case Manager` = Enf_Case_Mgr,
-                `Registration Number` = Enc_Reg_Fac_Num,
-                `Program Name` = Program_Name,
-                `Permit Number` = Enc_Pmt_Pc_Num,
-                `NOV Number` = Enc_Nov_Number,
-                `NOV Date` = Enc_Nov_Date,
-                `Executed Date` = Enc_Executed_Date,
-                `Term Date` = Enc_Terminated_Date, 
-                `Cash Civil Charge` = ECC_CASH_CIVIL_CHARGE, 
-                `Action Code` = EAC_DESCRIPTION, 
-                `Status Code` = Status_Code_Desc, 
-                Comments = Enc_Status_Comments) %>%
-  left_join(dplyr::select(enfFacilities, Enc_Enf_Facility_Id = Efc_Id, `Facility Name` = Efc_Facility_Name),
-            by = "Enc_Enf_Facility_Id") %>%
-  dplyr::select(`Facility Name`, everything(), -c(Enc_Enf_Facility_Id)) %>%
-  # drop all rows with no data
-  drop_na(`Facility Name`, `EA Number`) %>%
-  # first fix date fields
-  mutate(`NOV Date` = as.POSIXct(`NOV Date`, format = "%m/%d/%Y", tz = 'EST'),
-         `Executed Date` = as.POSIXct(`Executed Date`, format = "%m/%d/%Y", tz = 'EST'),
-         `Term Date` = as.POSIXct(`Term Date`, format = "%m/%d/%Y", tz = 'EST')) %>%
-  # fix factor levels for plotting by program
-  mutate(Program = as.factor(case_when(`Program Name` %in% c( "Solid Waste", "Hazardous Waste") ~ "Waste",
-                                       `Program Name` %in% c("VWPP") ~ "VWP",
-                                       is.na(`Program Name`) | 
-                                         `Program Name` %in% c("PReP", "VPA", 
-                                                               "Multimedia", "Oil Spill", 
-                                                               "Other", "Groundwater","Const. Storm.") ~ "Other", 
-                                       `Program Name` %in% c("UST", "AST") ~ "AST/UST", 
-                                       TRUE ~ as.character(`Program Name`)))) %>%
-  # add date of pull and calculate days Pending
-  mutate(pullDate = as.Date(Sys.Date()),
-         `Days Pending` = case_when(is.na(`Term Date`) ~ trunc(time_length(interval(`NOV Date`, pullDate), unit = 'day')),
-                                    TRUE ~ trunc(time_length(interval(`NOV Date`, `Term Date`), unit = 'day'))))
-
-```
-
-
-
 
 Pin fresh data to board.
 
 ```{r pin to rsconnect}
-pin(collectorID, description = 'Wqm_Collector_Cds_Codes_Wqm_View from ODS', board = "rsconnect")
 pin(masterTaxaGenus, description = "Edas_Benthic_Master_Taxa_View from ODS", board = "rsconnect")
 pin(benthics, description = "Edas_Benthic_View from ODS", board = "rsconnect")
 pin(benSamps, description = "Edas_Benthic_Sample_View from ODS", board = "rsconnect")
@@ -581,28 +496,7 @@ pin(VSCIresults, description = "VSCI results calculated from ODS_test", board = 
 pin(VCPMI63results, description = "VCPMI63 + Chowan results calculated from ODS", board = "rsconnect")
 pin(VCPMI65results, description = "VCPMI65 - Chowan results calculated from ODS", board = "rsconnect")
 
-
-pin(WQM_Stations_View, description = "Wqm_Stations_View from ODS", board = "rsconnect")
-pin(WQM_Sta_GIS_View, description = "Wqm_Sta_GIS_View from ODS", board = "rsconnect")
-pin(WQM_Station_Full, description = "first 25k records from WQM Stations (full) from GIS REST service", board = "rsconnect")
-
-
-pin(WQM_Stations_Spatial, Description = 'Weekly rebuild of all stations in WQM_Sta_GIS_View with accurate spatial information', board = 'rsconnect')
-
-
-#pin(enfFacilities, description = "Enf_Facilities_View from ODS", board = "rsconnect")
-#pin(enfCases, description = "Enforcement Cases filtered to start of year", board = "rsconnect")
-
 ```
 
-
-
-
-
-
-Get data back from rsconnect
-```{r reverse}
-pin_get("masterTaxaGenus", board = "rsconnect")
-```
 
 
